@@ -6,15 +6,14 @@
 import numpy as np
 import geopandas as gpd
 import datetime as dt
-from dotenv import load_dotenv, find_dotenv
 import os
 import clr
+from . import config
 
 # Set path to MIKE SDK
-load_dotenv(find_dotenv())
-sdk_path = os.getenv('MIKE_SDK')
-dfs_dll = os.getenv('MIKE_DFS')
-eum_dll = os.getenv('MIKE_EUM')
+sdk_path = config.MIKE_SDK
+dfs_dll = config.MIKE_DFS
+eum_dll = config.MIKE_EUM
 clr.AddReference(os.path.join(sdk_path, dfs_dll))
 clr.AddReference(os.path.join(sdk_path, eum_dll))
 clr.AddReference('System')
@@ -45,7 +44,7 @@ class Mesh(object):
         (x,y,z) coordinate for each node
     elements : ndarray, shape (num_ele, 3)
         (x,y,z) coordinate for each element
-    ele_table : ndarray, shape (num_ele, 3)
+    element_table : ndarray, shape (num_ele, 3)
         Defines for each element the nodes that define the element.
     node_table : ndarray, shape (num_nodes, n)
         Defines for each node the element adjacent to this node. May contain
@@ -72,6 +71,9 @@ class Mesh(object):
     Many of these methods have been adapated from the DHI MATLAB Toolbox:
         https://www.mikepoweredbydhi.com/download/mike-by-dhi-tools/
         coastandseatools/dhi-matlab-toolbox
+    Method grid_res()
+        Grid interpolation paramters which have additional attributes
+        if calculated
     """
 
     def __init__(self, filename=None):
@@ -79,6 +81,11 @@ class Mesh(object):
         self._file_input = False
         self.zUnitKey = 1000  # Default value (1000 = meter)
         self.lyrs = {}  # Dict for model input layers ie. roughness
+
+        # Grid interpolation flags [see method grid_res()]
+        self._grid_calc = False
+        self._grid_res = None
+        self._grid_node = None
 
         if filename is not None:
             self.read_mesh()
@@ -290,6 +297,11 @@ class Mesh(object):
 
         # Perform spatial join
         join_df = gpd.sjoin(mesh_df, input_df, how='left', op='within')
+
+        # Drop duplicated points; there is the potential to have duplicated
+        # points when they intersect two different polygons. Keep the first
+        join_df = join_df[~join_df.index.duplicated(keep='first')]
+
         self.lyrs[lyr_name] = np.array(join_df[field_attribute])
 
         if output_shp is not None:
@@ -389,6 +401,165 @@ class Mesh(object):
             fig, ax = _mesh_plot(self.nodes[:,0], self.nodes[:,1],
                                  self.element_table, kwargs)
             return fig, ax
+
+    def grid_res(self, res, nodes=True):
+        """
+        Calculate grid parameters at specified resolution for either nodes or
+        element coordinates. These parameters are used for interpolating
+        node or element values to regular spaced grids efficiently.
+
+        Parameters
+        ----------
+        res : int
+            grid resolution
+        nodes : bool
+            If True, use node coordinates as input
+            Else, use element coordinates
+
+        Returns
+        -------
+        Updates the following class attributes:
+
+        grid_x : ndarray, shape (len_xgrid, len_ygrid)
+            x grid at specified resolution
+        grid_y : ndarray, shape (len_xgrid, len_ygrid)
+            y grid at specified resolution
+        grid_vertices : ndarray, shape (num_nodes/elements, 3)
+            vertices for triangulation applied to (x, y) for input to
+            interpolation
+        grid_weights : ndarray, shape (num_nodes/elements, 3)
+            weights for grid_x and grid_y based on unstructured node/element
+            (x,y). Input for interpolation.
+
+        """
+        from . import _gridded_interpolate as _gi
+
+        if nodes:
+            x = self.nodes[:,0]
+            y = self.nodes[:,1]
+        else:
+            x = self.elements[:,0]
+            y = self.elements[:,1]
+
+        # Gridded (x, y)
+        self.grid_x, self.grid_y = _gi.dfsu_XY_meshgrid(x, y, res=res)
+
+        # Interpolation vertices and weights
+        all_gridded_points = np.column_stack((self.grid_x.flatten(),
+                                              self.grid_y.flatten()))
+        xy = np.column_stack((x, y))
+        self.grid_vertices, self.grid_weights = _gi.interp_weights(
+            xy,
+            all_gridded_points)
+
+        # Update grid calculations flag
+        self._grid_calc = True
+        self._grid_res = res
+        self._grid_node = nodes
+
+    def meshgrid(self, res):
+        """
+        Create X and Y meshgrid covering node coordinates
+
+        Parameters
+        ----------
+        res : int
+            grid resolution
+
+        Returns
+        -------
+        grid_x : ndarray, shape (len_xgrid, len_ygrid)
+            x grid at specified resolution
+        grid_y : ndarray, shape (len_xgrid, len_ygrid)
+            y grid at specified resolution
+
+        """
+
+        from . import _gridded_interpolate as _gi
+
+        grid_x, grid_y = _gi.dfsu_XY_meshgrid(self.nodes[:,0],
+                                              self.nodes[:,1],
+                                              res=res)
+
+        return grid_x, grid_y
+
+    def mesh_details(self):
+        """
+        Get min and max for input x and y ndarrays; shape (num_nodes,)
+        """
+        from . import _gridded_interpolate as _gi
+
+        min_x, max_x, min_y, max_y = _gi.dfsu_details(self.nodes[:,0],
+                                                      self.nodes[:,1])
+
+        return min_x, max_x, min_y, max_y
+
+    def mask(self):
+        """
+        Create a Shapely polygon mesh domain mask.
+
+        Determines mesh boundary from node boundary codes.
+
+        Returns
+        -------
+        poly_mask : shapely Polygon object
+            Polygon of the mesh domain.
+
+        """
+
+        # Select boundary nodes
+        nb_idx = self.node_ids[self.node_boundary_codes != 0]
+
+        # Determine boundary edges
+        be_idx = _determine_boundary_edges_idx(nb_idx, self.element_table)
+
+        # Order and seperate boundary edges in to respective polygons
+        all_polygons = _extract_all_polygons(be_idx)
+
+        # Determine polygon coordinates
+        all_poly_coords = _polygon_coords(self.nodes, all_polygons)
+
+        # Create mesh mask as polygon object
+        poly_mask = _polygon_mask(all_poly_coords)
+
+        return poly_mask
+
+    def boolean_mask(self, res=1000, mesh_mask=None):
+        """
+        Create a boolean mask of a regular grid at input resolution indicating
+        if gridded points are within the model mesh.
+
+        Parameters
+        ----------
+        res : int
+            Grid resolution
+        mesh_mask : shapely Polygon object, optional
+            Mesh domain mask output from the method mask(). If this is not
+            provided, it will be created.
+
+        Returns
+        -------
+        bool_mask : ndarray, shape (len_xgrid, len_ygrid)
+            Boolean mask covering the regular grid for the mesh domain
+
+        """
+        from . import _gridded_interpolate as _gi
+        from shapely.geometry import Point
+
+        if mesh_mask is None:
+            mesh_mask = self.mask()
+
+        # Create (x,y) grid at input resolution
+        X, Y = _gi.dfsu_XY_meshgrid(self.nodes[:,0], self.nodes[:,1], res=res)
+
+        # Create boolean mask
+        bool_mask = []
+        for xp, yp in zip(X.ravel(), Y.ravel()):
+            bool_mask.append(Point(xp, yp).within(mesh_mask))
+        bool_mask = np.array(bool_mask)
+        bool_mask = np.reshape(bool_mask, X.shape)
+
+        return bool_mask
 
 
 def _dfsu_builder(mesh_path):
@@ -583,3 +754,134 @@ def _filled_mesh_plot(x, y, z, element_table, kwargs=None):
     tf = ax.tricontourf(t, z, **kwargs)
 
     return fig, ax, tf
+
+
+"""
+mesh mask
+"""
+
+
+def _determine_boundary_edges_idx(nb_idx, element_table):
+    """
+    Calculate the unordered mesh boundary edges and returns boundar edge
+    indices.
+
+    Parameters
+    ----------
+    nb_idx : ndarray, shape (num_boundary_nodes,)
+        Boundary node indices
+    element_table : ndarray, shape (num_ele, 3)
+        Defines for each element the nodes that define the element.
+
+    Returns
+    -------
+    be_idx : ndarray, shape (num_boundary_edges, 2)
+        Unordered boundary edges; has [start_node_idx, end_node_idx] for each
+        edge
+
+    """
+    # Get all element edges
+    all_edges = element_table[:, [0, 1, 1, 2, 2, 0]]
+    all_edges = all_edges.reshape((-1, 2))
+    all_edges = np.sort(all_edges)
+
+    # Select only edges that occurr once; these are potential
+    # boundary edges
+    unique_edges, edges_count = np.unique(all_edges, axis=0, return_counts=True)
+    non_duplicate_edges = unique_edges[edges_count == 1]
+
+    # Select only edges that have both nodes as boundary nodes
+    # This is probably not needed but will make certain that edges
+    # are boundary edges
+    be_idx = non_duplicate_edges[np.isin(non_duplicate_edges, nb_idx).sum(axis=1) == 2]
+
+    return be_idx
+
+
+def _extract_all_polygons(be_idx):
+    """
+    Determine polygons and each polygons node order from output of
+    _determine_boundary_edge_idx()
+    """
+    # List to store all polygons
+    all_polygons = []
+
+    # Boolean for if edge has been visited
+    visited = np.zeros(len(be_idx), dtype=bool)
+
+    # Start traversal
+    while not np.all(visited):
+        polygon = []
+
+        # Determine which edges have not been visited
+        remaining_edges = be_idx[~visited]
+
+        # Select starting conditions
+        first_edge = remaining_edges[0]
+        node_start = first_edge[0]
+        node_next = first_edge[1]
+
+        polygon.append(node_start)
+
+        next_edge = [np.nan, np.nan]
+
+        # Loop through all edges in polygon until
+        # we return to the first edge
+        while not np.all(np.equal(first_edge, next_edge)):
+            # Add next node to polygon
+            polygon.append(node_next)
+
+            # Find next edge
+
+            # Edges with start node
+            equal_start_idx = np.argwhere(node_start == be_idx)[:,0]
+            # Edges with next node
+            equal_next_idx = np.argwhere(node_next == be_idx)[:,0]
+
+            # Want edge with next node but not the start node
+            next_edge_idx = equal_next_idx[~np.isin(equal_next_idx, equal_start_idx)]
+            next_edge = be_idx[next_edge_idx]
+
+            # Update node_start
+            node_start = node_next
+            node_next = next_edge[next_edge != node_start][0]
+
+            # Update edge as visited
+            visited[next_edge_idx] = True
+
+        polygon = np.array(polygon)
+        all_polygons.append(polygon)
+
+    return all_polygons
+
+
+def _polygon_coords(nodes, mesh_polygons):
+    """
+    Determine each polygons node (x,y) coordinates from _extract_all_polygons()
+    """
+    poly_coords = []
+    for p in mesh_polygons:
+        poly_coords.append(nodes[p - 1, :2])
+    return poly_coords
+
+
+def _polygon_mask(polygon_coords):
+    """
+    Create Shapely polygon covering mesh domain from _polygon_coords()
+    """
+
+    from shapely.geometry import Polygon
+
+    # Get largest area polygon
+    poly_areas = [Polygon(p).area for p in polygon_coords]
+    max_area_idx = np.argmax(poly_areas)
+
+    # Select largest polygon; this is the boundary
+    max_polygon = polygon_coords[max_area_idx]
+
+    # Drop max area polygon
+    internal_polygons = [p for i, p in enumerate(polygon_coords) if i != max_area_idx]
+
+    boundary_polygon = Polygon(shell=max_polygon, holes=internal_polygons)
+
+    return boundary_polygon

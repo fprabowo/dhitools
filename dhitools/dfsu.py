@@ -7,14 +7,13 @@ Author: Robert Wall
 import numpy as np
 from . import mesh
 from . import _utils
-from dotenv import load_dotenv, find_dotenv
+from . import config
 import os
 import clr
 
 # Set path to MIKE SDK
-load_dotenv(find_dotenv())
-sdk_path = os.getenv('MIKE_SDK')
-dfs_dll = os.getenv('MIKE_DFS')
+sdk_path = config.MIKE_SDK
+dfs_dll = config.MIKE_DFS
 clr.AddReference(os.path.join(sdk_path, dfs_dll))
 clr.AddReference('System')
 
@@ -145,7 +144,7 @@ class Dfsu(mesh.Mesh):
 
         Returns
         -------
-        node_data : ndarray, shape (num_elements,[tstep_end-tstep_start])
+        node_data : ndarray, shape (num_nodes,[tstep_end-tstep_start])
             Node data for specified item and time steps
         """
         dfsu_object = dfs.DfsFileFactory.DfsuFileOpen(self.filename)
@@ -363,6 +362,179 @@ class Dfsu(mesh.Mesh):
                                              kwargs)
 
         return fig, ax, tf
+
+    def gridded_item(self, item_name, tstep_start=None, tstep_end=None,
+                     res=1000, node=True):
+        """
+        Calculate gridded item data, either from nodes or elements, at
+        specified grid resolution and for a range of time steps. Allows
+        for downsampling of high resolution mesh's to a more manageable size.
+
+        The method grid_res() needs to be run before this to calculate the grid
+        parameters needed for interpolation. Pre-calculating these also greatly
+        improves run-time. res and node must be consistent between grid_res()
+        and gridded_item().
+
+        Parameters
+        ----------
+        item_name : str
+            Specified item to return node data. Item names are found in
+            the `Dfsu.items` attribute.
+        tstep_start : int or None, optional
+            Specify time step for node data. Timesteps begin from 0.
+            If `None`, returns data from 0 time step.
+        tstep_end : int or None, optional
+            Specify last time step for node data. Allows for range of time
+            steps to be returned, where `tstep_end` is included.Must be
+            positive int <= number of timesteps
+            If `None`, returns single time step specified by `tstep_start`
+            If `-1`, returns all time steps from `tstep_start`:end
+        res : int
+            Grid resolution
+        node : bool
+            If true, interpolate from node data,
+            Else, interpolate from element data
+
+        Returns
+        -------
+        z_interp : ndarray, shape (num_timsteps, len_xgrid, len_ygrid)
+            Interpolated z grid for each timestep
+        """
+
+        from . import _gridded_interpolate as _gi
+
+        # Check that grid parameters have been calculated and if they are,
+        # that they match the specified res
+        assert self._grid_calc is True, \
+            "Must calculate grid parameters first using method grid_res(res)"
+        assert self._grid_res == res, \
+            "Input grid resolution must equal resolution input to grid_res()"
+        assert self._grid_node == node, \
+            "grid_res(node) must be consistent with gridded_item(node)"
+
+        if node:
+            z = self.item_node_data(item_name, tstep_start, tstep_end)
+        else:
+            z = self.item_element_data(item_name, tstep_start, tstep_end)
+
+        # Interpolate z to regular grid
+        num_tsteps = z.shape[1]
+        z_interp = np.zeros(shape=(num_tsteps,
+                                   self.grid_x.shape[0],
+                                   self.grid_x.shape[1]))
+        for i in range(num_tsteps):
+            z_interp_flat = _gi.interpolate(z[:,i], self.grid_vertices,
+                                            self.grid_weights)
+            z_interp_grid = np.reshape(z_interp_flat, (self.grid_x.shape[0],
+                                                       self.grid_y.shape[1]))
+            z_interp[i] = z_interp_grid
+
+        return z_interp
+
+    def gridded_stats(self, item_name, tstep_start=None, tstep_end=None,
+                      node=True, max=True, res=1000):
+        """
+        Calculate gridded item maximum or minimum across time range,
+        either from nodes or elements, at specified grid resolution. Allows
+        for downsampling of high resolution mesh's to a more manageable size.
+
+        The method grid_res() needs to be run before this to calculate the grid
+        parameters needed for interpolation. Pre-calculating these also greatly
+        improves run-time. res and node must be consistent between grid_res()
+        and gridded_item().
+
+        Parameters
+        ----------
+        item_name : str
+            Specified item to return element data. Item names are found in
+            the `Dfsu.items` attribute.
+        tstep_start : int or None, optional
+            Specify time step for data considered in determining maximum.
+            Timesteps begin from 0.
+            If `None`, returns data from 0 time step.
+        tstep_end : int or None, optional
+            Specify last time step for data considered in determining maximum
+            Must be positive int <= number of timesteps
+            If `None`, returns all time steps from `tstep_start`:end
+        node : boolean, optional
+            If True, returns item data at node rather than element
+        max : boolean, optional
+            If True, returns max (see method max_item()) else returns min
+
+        Returns
+        -------
+        z_interp : ndarray, shape (len_xgrid, len_ygrid)
+            Interpolated z grid
+        """
+
+        from . import _gridded_interpolate as _gi
+
+        # Check that grid parameters have been calculated and if they are,
+        # that they match the specified res
+        assert self._grid_calc is True, \
+            "Must calculate grid parameters first using method grid_res(res)"
+        assert self._grid_res == res, \
+            "Input grid resolution must equal resolution input to grid_res()"
+        assert self._grid_node == node, \
+            "grid_res(node) must be consistent with gridded_item(node)"
+
+        if max:
+            z = self.max_item(item_name, tstep_start, tstep_end, node=node)
+        else:
+            z = self.min_item(item_name, tstep_start, tstep_end, node=node)
+        z_interp_flat = _gi.interpolate(z, self.grid_vertices,
+                                        self.grid_weights)
+        z_interp = np.reshape(z_interp_flat, (self.grid_x.shape[0],
+                                              self.grid_y.shape[1]))
+
+        return z_interp
+
+    def boolean_mask(self, mesh_mask, res=1000):
+        """
+        Create a boolean mask of a regular grid at input resolution indicating
+        if gridded points are within the model mesh.
+
+        This is slightly different to the mesh method which will automatically
+        create the mask if it isn't provided. This will not automatically
+        create the mask and the mask method has been disabled. See mask() for
+        further details.
+
+        Parameters
+        ----------
+        res : int
+            Grid resolution
+        mesh_mask : shapely Polygon object, optional
+            Mesh domain mask output from the method mask(). If this is not
+            provided, it will be created.
+
+        Returns
+        -------
+        bool_mask : ndarray, shape (len_xgrid, len_ygrid)
+            Boolean mask covering the regular grid for the mesh domain
+
+        """
+        from . import _gridded_interpolate as _gi
+        from shapely.geometry import Point
+
+        # Create (x,y) grid at input resolution
+        X, Y = _gi.dfsu_XY_meshgrid(self.nodes[:,0], self.nodes[:,1], res=res)
+
+        # Create boolean mask
+        bool_mask = []
+        for xp, yp in zip(X.ravel(), Y.ravel()):
+            bool_mask.append(Point(xp, yp).within(mesh_mask))
+        bool_mask = np.array(bool_mask)
+        bool_mask = np.reshape(bool_mask, X.shape)
+
+        return bool_mask
+
+    def mask(self):
+        """
+        Method disabled for dfsu class since the node boundary codes for
+        dfsu files are not consistent with mesh boundary codes especially
+        when dfsu area output is a subset of the mesh
+        """
+        raise AttributeError("'dfsu' object has no attribute 'mask'")
 
 
 def _dfsu_info(dfsu_object):
